@@ -29,11 +29,12 @@ GEMINI_MODELS = [
     m.strip()
     for m in os.environ.get(
         "GEMINI_MODELS",
-        "gemini-3.8-flash,gemini-flash-lite-latest,gemini-2.5-flash",
+        "gemini-3.8-flash,gemini-flash-lite-latest",
     ).split(",")
     if m.strip()
 ]
-GEMINI_RETRIES = 3
+GEMINI_RETRIES = 4
+GEMINI_BACKOFF = [15, 30, 60]  # seconds; 503 "high demand" spikes last minutes
 _RETRYABLE = (
     genai_errors.ServerError,
     httpx.TransportError,
@@ -128,8 +129,17 @@ def curate_with_gemini(entries):
                 if not _retryable(e):
                     raise
                 if attempt < GEMINI_RETRIES - 1:
-                    time.sleep(2 ** (attempt + 2))
+                    time.sleep(GEMINI_BACKOFF[min(attempt, len(GEMINI_BACKOFF) - 1)])
     raise last_error
+
+
+def plain_digest(entries):
+    """Fallback when Gemini is unavailable: first TOP_N headlines as-is."""
+    today = datetime.now(JST).strftime("%Y/%m/%d")
+    lines = [f"📱 今日のIT関連ニュース（{today}）", "※AI要約が利用できなかったため見出しのみ"]
+    for e in entries[:TOP_N]:
+        lines.append(f"\n▶ {e['title']}（{e['source']}）\n{e['link']}")
+    return "\n".join(lines)
 
 
 def _model_unavailable(exc):
@@ -179,7 +189,13 @@ def send_to_line(text):
 
 def main():
     entries = fetch_recent_entries()
-    digest = curate_with_gemini(entries)
+    try:
+        digest = curate_with_gemini(entries)
+    except Exception as e:
+        if not (_retryable(e) or _model_unavailable(e)):
+            raise
+        print(f"Gemini unavailable, sending plain digest: {e}")
+        digest = plain_digest(entries)
     if not digest:
         return
     send_to_line(digest)
