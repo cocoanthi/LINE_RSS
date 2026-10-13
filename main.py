@@ -4,6 +4,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import feedparser
+import httpx
 import requests
 from google import genai
 from google.genai import errors as genai_errors
@@ -25,6 +26,11 @@ MAX_ITEMS_PER_FEED = 15
 TOP_N = int(os.environ.get("TOP_N", "6"))
 GEMINI_MODEL = "gemini-3.8-flash"
 GEMINI_RETRIES = 5
+_RETRYABLE = (
+    genai_errors.ServerError,
+    httpx.TransportError,
+    httpx.TimeoutException,
+)
 
 
 def fetch_recent_entries():
@@ -64,11 +70,16 @@ def _strip_html(text):
     return re.sub(r"<[^>]+>", "", text or "").strip()
 
 
+def _retryable(exc):
+    if isinstance(exc, _RETRYABLE):
+        return True
+    cause = getattr(exc, "__cause__", None) or getattr(exc, "__context__", None)
+    return isinstance(cause, _RETRYABLE)
+
+
 def curate_with_gemini(entries):
     if not entries:
         return None
-
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
     listing = "\n".join(
         f"{i+1}. [{e['source']}] {e['title']} — {e['link']}\n   概要: {e['summary']}"
@@ -91,17 +102,20 @@ def curate_with_gemini(entries):
 - ニュース本文以外の前置き・後書き・注釈は出力しない"""
 
     last_error = None
+    api_key = os.environ["GEMINI_API_KEY"]
     for attempt in range(GEMINI_RETRIES):
         try:
+            # Recreate the client: a dropped HTTP/2 connection is not reusable.
+            client = genai.Client(api_key=api_key)
             response = client.models.generate_content(
                 model=GEMINI_MODEL,
                 contents=prompt,
             )
             return response.text.strip()
-        except genai_errors.ServerError as e:
+        except Exception as e:
             last_error = e
-            if attempt == GEMINI_RETRIES - 1:
-                break
+            if not _retryable(e) or attempt == GEMINI_RETRIES - 1:
+                raise
             time.sleep(2 ** (attempt + 2))
     raise last_error
 
