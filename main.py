@@ -8,6 +8,7 @@ import httpx
 import requests
 from google import genai
 from google.genai import errors as genai_errors
+from google.genai import types as genai_types
 
 JST = timezone(timedelta(hours=9))
 
@@ -33,7 +34,7 @@ GEMINI_MODELS = [
     ).split(",")
     if m.strip()
 ]
-GEMINI_RETRIES = 4
+GEMINI_RETRIES = 3
 GEMINI_BACKOFF = [15, 30, 60]  # seconds; 503 "high demand" spikes last minutes
 _RETRYABLE = (
     genai_errors.ServerError,
@@ -115,7 +116,14 @@ def curate_with_gemini(entries):
         for attempt in range(GEMINI_RETRIES):
             try:
                 # Recreate the client: a dropped HTTP/2 connection is not reusable.
-                client = genai.Client(api_key=_secret("GEMINI_API_KEY"))
+                # SDK-internal retries are disabled so each attempt costs exactly
+                # one request against the free-tier daily quota.
+                client = genai.Client(
+                    api_key=_secret("GEMINI_API_KEY"),
+                    http_options=genai_types.HttpOptions(
+                        retry_options=genai_types.HttpRetryOptions(attempts=1)
+                    ),
+                )
                 response = client.models.generate_content(
                     model=model,
                     contents=prompt,
@@ -125,7 +133,7 @@ def curate_with_gemini(entries):
                 last_error = e
                 print(f"Gemini {model} attempt {attempt + 1} failed: {e}")
                 if _model_unavailable(e):
-                    break  # model doesn't exist for this key; try the next one
+                    break  # missing or out of quota for this key; try the next one
                 if not _retryable(e):
                     raise
                 if attempt < GEMINI_RETRIES - 1:
@@ -143,7 +151,9 @@ def plain_digest(entries):
 
 
 def _model_unavailable(exc):
-    return isinstance(exc, genai_errors.ClientError) and exc.code == 404
+    # 404: model retired for this key. 429: free-tier daily quota exhausted
+    # (resets hours later, so retrying the same model now is pointless).
+    return isinstance(exc, genai_errors.ClientError) and exc.code in (404, 429)
 
 
 def _secret(name):
