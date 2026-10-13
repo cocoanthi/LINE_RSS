@@ -1,10 +1,12 @@
 """IT news digest: fetch RSS feeds, curate with Gemini, push to LINE."""
 import os
+import time
 from datetime import datetime, timedelta, timezone
 
 import feedparser
 import requests
 from google import genai
+from google.genai import errors as genai_errors
 
 JST = timezone(timedelta(hours=9))
 
@@ -21,6 +23,8 @@ FEEDS = [
 LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "26"))
 MAX_ITEMS_PER_FEED = 15
 TOP_N = int(os.environ.get("TOP_N", "6"))
+GEMINI_MODEL = "gemini-3.8-flash"
+GEMINI_RETRIES = 5
 
 
 def fetch_recent_entries():
@@ -86,11 +90,20 @@ def curate_with_gemini(entries):
 - 全体で1500文字以内に収める
 - ニュース本文以外の前置き・後書き・注釈は出力しない"""
 
-    response = client.models.generate_content(
-        model="gemini-3.8-flash",
-        contents=prompt,
-    )
-    return response.text.strip()
+    last_error = None
+    for attempt in range(GEMINI_RETRIES):
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+            )
+            return response.text.strip()
+        except genai_errors.ServerError as e:
+            last_error = e
+            if attempt == GEMINI_RETRIES - 1:
+                break
+            time.sleep(2 ** (attempt + 2))
+    raise last_error
 
 
 def send_to_line(text):
