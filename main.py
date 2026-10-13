@@ -24,8 +24,16 @@ FEEDS = [
 LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "26"))
 MAX_ITEMS_PER_FEED = 15
 TOP_N = int(os.environ.get("TOP_N", "6"))
-GEMINI_MODEL = "gemini-3.8-flash"
-GEMINI_RETRIES = 5
+# Tried in order; on persistent 503 (high demand) fall through to the next.
+GEMINI_MODELS = [
+    m.strip()
+    for m in os.environ.get(
+        "GEMINI_MODELS",
+        "gemini-3.8-flash,gemini-flash-lite-latest,gemini-2.5-flash",
+    ).split(",")
+    if m.strip()
+]
+GEMINI_RETRIES = 3
 _RETRYABLE = (
     genai_errors.ServerError,
     httpx.TransportError,
@@ -102,21 +110,30 @@ def curate_with_gemini(entries):
 - ニュース本文以外の前置き・後書き・注釈は出力しない"""
 
     last_error = None
-    for attempt in range(GEMINI_RETRIES):
-        try:
-            # Recreate the client: a dropped HTTP/2 connection is not reusable.
-            client = genai.Client(api_key=_secret("GEMINI_API_KEY"))
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-            )
-            return response.text.strip()
-        except Exception as e:
-            last_error = e
-            if not _retryable(e) or attempt == GEMINI_RETRIES - 1:
-                raise
-            time.sleep(2 ** (attempt + 2))
+    for model in GEMINI_MODELS:
+        for attempt in range(GEMINI_RETRIES):
+            try:
+                # Recreate the client: a dropped HTTP/2 connection is not reusable.
+                client = genai.Client(api_key=_secret("GEMINI_API_KEY"))
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                )
+                return response.text.strip()
+            except Exception as e:
+                last_error = e
+                print(f"Gemini {model} attempt {attempt + 1} failed: {e}")
+                if _model_unavailable(e):
+                    break  # model doesn't exist for this key; try the next one
+                if not _retryable(e):
+                    raise
+                if attempt < GEMINI_RETRIES - 1:
+                    time.sleep(2 ** (attempt + 2))
     raise last_error
+
+
+def _model_unavailable(exc):
+    return isinstance(exc, genai_errors.ClientError) and exc.code == 404
 
 
 def _secret(name):
