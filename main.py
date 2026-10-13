@@ -102,11 +102,10 @@ def curate_with_gemini(entries):
 - ニュース本文以外の前置き・後書き・注釈は出力しない"""
 
     last_error = None
-    api_key = os.environ["GEMINI_API_KEY"]
     for attempt in range(GEMINI_RETRIES):
         try:
             # Recreate the client: a dropped HTTP/2 connection is not reusable.
-            client = genai.Client(api_key=api_key)
+            client = genai.Client(api_key=_secret("GEMINI_API_KEY"))
             response = client.models.generate_content(
                 model=GEMINI_MODEL,
                 contents=prompt,
@@ -120,13 +119,28 @@ def curate_with_gemini(entries):
     raise last_error
 
 
+def _secret(name):
+    raw = os.environ[name]
+    cleaned = (
+        raw.replace("\ufeff", "")
+        .replace("\u200b", "")
+        .strip()
+        .replace("\r", "")
+        .replace("\n", "")
+        .strip()
+    )
+    if cleaned.lower().startswith("bearer "):
+        cleaned = cleaned[7:].strip()
+    return cleaned
+
+
 def send_to_line(text):
     """Broadcasts to every friend of the LINE Official Account (bot).
 
     Using broadcast avoids needing to capture a specific userId via a
     webhook server; for personal use, just add your own bot as a friend.
     """
-    token = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
+    token = _secret("LINE_CHANNEL_ACCESS_TOKEN")
 
     resp = requests.post(
         "https://api.line.me/v2/bot/message/broadcast",
@@ -137,6 +151,12 @@ def send_to_line(text):
         json={"messages": [{"type": "text", "text": text}]},
         timeout=20,
     )
+    if resp.status_code == 401:
+        raise SystemExit(
+            "LINE returned 401 Unauthorized. Update GitHub secret "
+            "LINE_CHANNEL_ACCESS_TOKEN with a new long-lived channel access "
+            "token from LINE Developers Console > Messaging API."
+        )
     resp.raise_for_status()
 
 
