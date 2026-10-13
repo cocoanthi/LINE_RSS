@@ -1,17 +1,5 @@
 """IT news digest: fetch RSS feeds, curate with Gemini, push to LINE."""
 import os
-import sys
-
-# Must run before any Unicode is printed. GitHub Actions can default to ASCII.
-os.environ.setdefault("PYTHONIOENCODING", "utf-8")
-os.environ.setdefault("PYTHONUTF8", "1")
-for _stream in (sys.stdout, sys.stderr):
-    if hasattr(_stream, "reconfigure"):
-        try:
-            _stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
-
 from datetime import datetime, timedelta, timezone
 
 import feedparser
@@ -33,51 +21,6 @@ FEEDS = [
 LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "26"))
 MAX_ITEMS_PER_FEED = 15
 TOP_N = int(os.environ.get("TOP_N", "6"))
-HTTP_TIMEOUT = 20
-USER_AGENT = "LINE-IT-News/1.0 (+https://github.com/cocoanthi/LINE_RSS)"
-
-
-def _safe_print(*args, file=None, **kwargs):
-    """Print Unicode even when stdout/stderr is stuck on ASCII."""
-    target = sys.stderr if file is sys.stderr else (file or sys.stdout)
-    try:
-        print(*args, file=target, **kwargs)
-        return
-    except UnicodeEncodeError:
-        pass
-    sep = kwargs.get("sep", " ")
-    end = kwargs.get("end", "\n")
-    text = sep.join(str(a) for a in args) + end
-    buf = getattr(target, "buffer", None)
-    if buf is None:
-        raise
-    buf.write(text.encode("utf-8", errors="replace"))
-    buf.flush()
-
-
-def _ascii_secret(name):
-    """HTTP headers (httpx/requests) require ASCII. Strip copy/paste junk."""
-    raw = os.environ[name]
-    cleaned = (
-        raw.replace("\ufeff", "")
-        .replace("\u200b", "")
-        .replace("\u200c", "")
-        .replace("\u200d", "")
-        .replace("\xa0", " ")
-        .strip()
-        .replace("\r", "")
-        .replace("\n", "")
-        .replace(" ", "")
-    )
-    bad = [i for i, ch in enumerate(cleaned) if not ch.isascii()]
-    if bad:
-        raise SystemExit(
-            f"[ERROR] {name} has non-ASCII characters at positions {bad[:8]}. "
-            "HTTP headers cannot contain them. Re-copy the secret from the console."
-        )
-    if not cleaned:
-        raise SystemExit(f"[ERROR] {name} is empty")
-    return cleaned
 
 
 def fetch_recent_entries():
@@ -85,15 +28,8 @@ def fetch_recent_entries():
     entries = []
     for source_name, url in FEEDS:
         try:
-            resp = requests.get(
-                url,
-                timeout=HTTP_TIMEOUT,
-                headers={"User-Agent": USER_AGENT},
-            )
-            resp.raise_for_status()
-            parsed = feedparser.parse(resp.content)
-        except Exception as e:
-            _safe_print(f"[WARN] failed to fetch {source_name}: {e}", file=sys.stderr)
+            parsed = feedparser.parse(url)
+        except Exception:
             continue
         for entry in parsed.entries[:MAX_ITEMS_PER_FEED]:
             published = _entry_time(entry)
@@ -128,8 +64,7 @@ def curate_with_gemini(entries):
     if not entries:
         return None
 
-    api_key = _ascii_secret("GEMINI_API_KEY")
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
     listing = "\n".join(
         f"{i+1}. [{e['source']}] {e['title']} — {e['link']}\n   概要: {e['summary']}"
@@ -152,7 +87,7 @@ def curate_with_gemini(entries):
 - ニュース本文以外の前置き・後書き・注釈は出力しない"""
 
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.8-flash",
         contents=prompt,
     )
     return response.text.strip()
@@ -164,7 +99,7 @@ def send_to_line(text):
     Using broadcast avoids needing to capture a specific userId via a
     webhook server; for personal use, just add your own bot as a friend.
     """
-    token = _ascii_secret("LINE_CHANNEL_ACCESS_TOKEN")
+    token = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 
     resp = requests.post(
         "https://api.line.me/v2/bot/message/broadcast",
@@ -173,29 +108,17 @@ def send_to_line(text):
             "Authorization": f"Bearer {token}",
         },
         json={"messages": [{"type": "text", "text": text}]},
-        timeout=HTTP_TIMEOUT,
+        timeout=20,
     )
     resp.raise_for_status()
 
 
 def main():
-    _safe_print(
-        f"[INFO] stdout={sys.stdout.encoding!r} stderr={sys.stderr.encoding!r}"
-    )
     entries = fetch_recent_entries()
-    _safe_print(f"[INFO] fetched {len(entries)} recent entries")
-
     digest = curate_with_gemini(entries)
     if not digest:
-        _safe_print("[INFO] no news to send today, skipping")
         return
-
-    _safe_print("---- digest ----")
-    _safe_print(digest)
-    _safe_print("----------------")
-
     send_to_line(digest)
-    _safe_print("[INFO] sent to LINE")
 
 
 if __name__ == "__main__":
